@@ -39,6 +39,9 @@ BOARD_CHANNEL_ID = env_int("LEADERBOARD_CHANNEL_ID")
 WINNERS_CHANNEL_ID = env_int("WINNERS_CHANNEL_ID")
 STAFF_CHANNEL_ID = env_int("STAFF_CHANNEL_ID")
 WINS_CHANNEL_ID = env_int("WINS_CHANNEL_ID")
+LAUNCH_MONTH = os.getenv("LAUNCH_MONTH", "").strip()        # e.g. 2026-10: earlier months are practice, never announced
+HYPE_CHANNEL_ID = env_int("HYPE_CHANNEL_ID")                 # where 24h / 1h countdown posts go, e.g. #general
+REVEAL_CHANNEL_IDS = {int(x) for x in os.getenv("REVEAL_CHANNEL_IDS", "").split(",") if x.strip()}
 EXCLUDED_USER_IDS = {int(x) for x in os.getenv("EXCLUDED_USER_IDS", "").split(",") if x.strip()}
 EXCLUDED_ROLE_IDS = {int(x) for x in os.getenv("EXCLUDED_ROLE_IDS", "").split(",") if x.strip()}
 ALLOWED_CHANNELS = {int(x) for x in os.getenv("ALLOWED_CHANNEL_IDS", "").split(",") if x.strip()}
@@ -212,6 +215,7 @@ class GiveawayBot(discord.Client):
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
         ticker.start()
+        clock.start()
 
 
 bot = GiveawayBot()
@@ -521,10 +525,12 @@ async def board_embed(guild):
             lines.append(f"{rank} 👑 **{name}** — `{r['pts']:,} pts`")
         else:
             lines.append(f"{rank} {name} — `{r['pts']:,} pts`")
+    final_day = race_live(month_key()) and next_month_start() - now() <= dt.timedelta(hours=24)
     e = discord.Embed(
-        title=f"🏆 {now().strftime('%B')} leaderboard",
+        title=(f"⏰ FINAL 24 HOURS · {now().strftime('%B')} leaderboard" if final_day
+               else f"🏆 {now().strftime('%B')} leaderboard"),
         description="\n".join(lines) if rows else "\n".join(lines + ["No points yet this month. Start chatting!"]),
-        color=0xF0B232,
+        color=0xED4245 if final_day else 0xF0B232,
     )
     if vip_leaders:
         vip_lines = [f"{MEDALS[n]} {display(guild, r['user_id'])} — `{r['pts']:,} pts` (#{overall} overall)"
@@ -534,7 +540,10 @@ async def board_embed(guild):
         e.add_field(name=f"👑 VIP race · leader wins {VIP_PRIZE}", value="No VIPs on the board yet. Wide open!", inline=False)
     e.add_field(name="Prize", value=PRIZE, inline=True)
     e.add_field(name="Top VIP bonus", value=VIP_PRIZE, inline=True)
-    e.add_field(name="Ends", value=discord.utils.format_dt(next_month_start(), "R"), inline=True)
+    ends = discord.utils.format_dt(next_month_start(), "R")
+    if final_day:
+        ends += f" · at {discord.utils.format_dt(next_month_start(), 't')}"
+    e.add_field(name="Ends", value=ends, inline=True)
     e.set_footer(text="🏆 = Monthly Champion · 👑 = VIP member · Updates every 10 minutes")
     return e
 
@@ -638,7 +647,7 @@ async def champions_embed(guild):
 # ---------- Tabs ----------
 # Discord has no real tabs, so these are buttons. On the public board, a tab opens your own
 # private copy ("Only you can see this"). Inside that copy, tabs switch in place.
-TABS = [("month", "This month", "📊"), ("vip", "VIP race", "👑"), ("champs", "Champions", "🏆"), ("stats", "My stats", "👤")]
+TABS = [("month", "This month", "📊"), ("champs", "Champions", "🏆"), ("stats", "My stats", "👤")]
 
 
 async def tab_embed(tab, guild, user):
@@ -668,7 +677,7 @@ class TabButton(discord.ui.Button):
 
 class EarnButton(discord.ui.Button):
     def __init__(self, public):
-        super().__init__(label="How to earn", style=discord.ButtonStyle.secondary, row=1,
+        super().__init__(label="How to earn", emoji="❓", style=discord.ButtonStyle.secondary, row=0,
                          custom_id="lb:earn" if public else None)
 
     async def callback(self, interaction: discord.Interaction):
@@ -904,17 +913,101 @@ async def send_vip_recaps(guild, month):
         await asyncio.sleep(1.5)   # stay well under Discord's rate limits
 
 
+def race_live(month):
+    """Months before LAUNCH_MONTH are practice: no winners, champion, recaps or hype posts."""
+    return not LAUNCH_MONTH or month >= LAUNCH_MONTH
+
+
+async def reveal_channels(guild):
+    """On launch, let @everyone see the channels listed in REVEAL_CHANNEL_IDS (other settings are kept)."""
+    for cid in REVEAL_CHANNEL_IDS:
+        ch = guild.get_channel(cid)
+        if ch is None:
+            continue
+        ow = ch.overwrites_for(guild.default_role)
+        ow.view_channel = True
+        try:
+            await ch.set_permissions(guild.default_role, overwrite=ow, reason="Giveaway launch")
+        except discord.Forbidden:
+            print(f"Can't unhide #{ch.name}: give the bot Manage Roles / Manage Permissions there.")
+
+
 async def maybe_close_month(guild):
     current = month_key()
     active = await get_setting("active_month")
     if active is None:
         await set_setting("active_month", current)
         return
-    if active != current:
-        await set_setting("active_month", current)
+    if active == current:
+        return
+    await set_setting("active_month", current)
+    if race_live(active):
         await close_month(guild, active)
-        await set_setting("board_message_id", "")   # start a fresh board post for the new month
         asyncio.create_task(send_vip_recaps(guild, active))
+    # remove last month's board so only the new one shows
+    old = await get_setting("board_message_id")
+    board_ch = guild.get_channel(BOARD_CHANNEL_ID)
+    if old and board_ch:
+        try:
+            await board_ch.get_partial_message(int(old)).delete()
+        except discord.HTTPException:
+            pass
+    await set_setting("board_message_id", "")
+    await refresh_board(guild)                      # post the new month's board right away
+    if LAUNCH_MONTH and current == LAUNCH_MONTH:
+        await reveal_channels(guild)
+
+
+async def countdown_posts(guild):
+    """24 hours and 1 hour before the month ends, hype the race in HYPE_CHANNEL_ID."""
+    month = month_key()
+    ch = guild.get_channel(HYPE_CHANNEL_ID) if HYPE_CHANNEL_ID else None
+    if ch is None or not race_live(month):
+        return
+    left = next_month_start() - now()
+    if left > dt.timedelta(hours=24):
+        return
+    key = "hype1" if left <= dt.timedelta(hours=1) else "hype24"
+    if await get_setting(f"{key}:{month}"):
+        return
+    await set_setting(f"{key}:{month}", "1")
+    await set_setting(f"hype24:{month}", "1")       # never send the 24h post after the 1h one
+    everyone = still_here(guild, await top(month, 5000))
+    top3 = everyone[:3]
+    lines = []
+    for i, r in enumerate(top3):
+        gap = f" ({top3[i - 1]['pts'] - r['pts']:,} behind)" if i else ""
+        lines.append(f"{MEDALS[i]} <@{r['user_id']}> — {r['pts']:,} pts{gap}")
+    vip = next((r for r in everyone if is_vip(guild, r["user_id"])), None)
+    end = next_month_start()
+    e = discord.Embed(
+        title="⏰ 1 HOUR LEFT!" if key == "hype1" else f"⏰ 24 hours left in the {now().strftime('%B')} race!",
+        description="\n".join(lines) or "Nobody's scored yet. Anyone can take it!",
+        color=0xED4245)
+    if vip:
+        e.add_field(name="👑 Top VIP", value=f"<@{vip['user_id']}> — {vip['pts']:,} pts", inline=True)
+    e.add_field(name="Ends", value=f"{discord.utils.format_dt(end, 'R')} · at {discord.utils.format_dt(end, 't')}", inline=True)
+    if BOARD_CHANNEL_ID:
+        e.add_field(name="Where do you stand?", value=f"Check <#{BOARD_CHANNEL_ID}>", inline=False)
+    await ch.send(embed=e, allowed_mentions=discord.AllowedMentions(users=False))
+
+
+@tasks.loop(seconds=30)
+async def clock():
+    """Runs every 30 seconds so the month flips (and channels unhide) right at midnight."""
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return
+    for step in (maybe_close_month, countdown_posts):
+        try:
+            await step(guild)
+        except Exception as exc:
+            print(f"{step.__name__} failed: {exc!r}")
+
+
+@clock.before_loop
+async def before_clock():
+    await bot.wait_until_ready()
 
 
 @tasks.loop(minutes=10)
@@ -922,7 +1015,7 @@ async def ticker():
     guild = bot.get_guild(GUILD_ID)
     if guild is None:
         return
-    for step in (maybe_close_month, check_pending_invites, sync_loyalty, refresh_board):
+    for step in (check_pending_invites, sync_loyalty, refresh_board):
         try:
             await step(guild)
         except Exception as exc:
