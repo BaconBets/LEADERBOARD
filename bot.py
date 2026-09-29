@@ -4,9 +4,11 @@ Points for chatting, daily check-ins, reactions, and invites, with anti-farming
 checks. Posts a live leaderboard, closes each month automatically, and awards a
 separate prize to the top VIP.
 """
+import asyncio
 import os
 import re
 import difflib
+import hashlib
 import datetime as dt
 from collections import defaultdict, deque
 from zoneinfo import ZoneInfo
@@ -28,9 +30,17 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 GUILD_ID = int(os.environ["GUILD_ID"])
 VIP_ROLE_ID = env_int("VIP_ROLE_ID")
 CHAMPION_ROLE_ID = env_int("CHAMPION_ROLE_ID")
+VIP_LOUNGE_CHANNEL_ID = env_int("VIP_LOUNGE_CHANNEL_ID")
+# Loyalty badges: months as VIP in a row -> role
+LOYALTY_TIERS = [(m, env_int(f"LOYALTY_{m}_ROLE_ID")) for m in (12, 6, 3)]   # highest first
+LOYALTY_TIERS = [(m, rid) for m, rid in LOYALTY_TIERS if rid]
+VIP_GRACE_DAYS = 7   # a lapsed payment re-added within this many days keeps their tenure
 BOARD_CHANNEL_ID = env_int("LEADERBOARD_CHANNEL_ID")
 WINNERS_CHANNEL_ID = env_int("WINNERS_CHANNEL_ID")
 STAFF_CHANNEL_ID = env_int("STAFF_CHANNEL_ID")
+WINS_CHANNEL_ID = env_int("WINS_CHANNEL_ID")
+EXCLUDED_USER_IDS = {int(x) for x in os.getenv("EXCLUDED_USER_IDS", "").split(",") if x.strip()}
+EXCLUDED_ROLE_IDS = {int(x) for x in os.getenv("EXCLUDED_ROLE_IDS", "").split(",") if x.strip()}
 ALLOWED_CHANNELS = {int(x) for x in os.getenv("ALLOWED_CHANNEL_IDS", "").split(",") if x.strip()}
 TZ = ZoneInfo(os.getenv("TIMEZONE", "America/Chicago"))
 PRIZE = os.getenv("PRIZE_TEXT", "[Set PRIZE_TEXT]")
@@ -38,7 +48,7 @@ VIP_PRIZE = os.getenv("VIP_PRIZE_TEXT", "[Set VIP_PRIZE_TEXT]")
 
 # ---------- Point rules ----------
 MSG_POINTS = 1
-MSG_COOLDOWN_SEC = 60
+MSG_COOLDOWN_SEC = 30
 MSG_MIN_CHARS = 5
 MSG_DAILY_CAP = 50
 MSG_SIMILARITY = 0.85          # how close counts as a repeat
@@ -50,6 +60,9 @@ STREAK_LEN = 7
 REACT_POINTS = 1
 REACT_DAILY_CAP = 20
 REACTOR_MIN_DAYS = 7           # reactor must have been in the server this long
+
+SLIP_POINTS = 15             # per winning-slip post with a new image
+SLIP_DAILY_MAX = 3           # slip posts that count per day
 
 INVITE_POINTS = 50
 INVITE_STAY_DAYS = 7
@@ -88,6 +101,15 @@ CREATE TABLE IF NOT EXISTS invites (
     joined_at TIMESTAMPTZ NOT NULL, account_created TIMESTAMPTZ NOT NULL,
     status TEXT NOT NULL, awarded_month TEXT,
     PRIMARY KEY (guild_id, invitee_id)
+);
+CREATE TABLE IF NOT EXISTS slip_images (
+    guild_id BIGINT, hash TEXT, user_id BIGINT NOT NULL, message_id BIGINT NOT NULL,
+    PRIMARY KEY (guild_id, hash)
+);
+CREATE TABLE IF NOT EXISTS vip_tenure (
+    guild_id BIGINT, user_id BIGINT,
+    vip_since TIMESTAMPTZ NOT NULL, lost_at TIMESTAMPTZ,
+    PRIMARY KEY (guild_id, user_id)
 );
 CREATE TABLE IF NOT EXISTS disqualified (
     guild_id BIGINT, user_id BIGINT, month TEXT,
@@ -144,9 +166,29 @@ def is_vip(guild, user_id):
     return bool(m and VIP_ROLE_ID and any(r.id == VIP_ROLE_ID for r in m.roles))
 
 
+BADGE_RE = re.compile("[\U0001F451\U0001F3C6]\uFE0F?")   # 👑 and 🏆
+
+
 def display(guild, user_id):
+    """Member's name with any 👑/🏆 they typed into it removed, so nobody can fake a badge."""
     m = guild.get_member(user_id)
-    return m.display_name if m else f"User {user_id}"
+    if not m:
+        return f"User {user_id}"
+    name = BADGE_RE.sub("", m.display_name).strip()
+    return name or BADGE_RE.sub("", m.name).strip() or "Member"
+
+
+def is_excluded(guild, user_id):
+    """Owner/staff who chat normally but aren't in the race."""
+    if user_id in EXCLUDED_USER_IDS:
+        return True
+    m = guild.get_member(user_id) if guild else None
+    return bool(m and EXCLUDED_ROLE_IDS and any(r.id in EXCLUDED_ROLE_IDS for r in m.roles))
+
+
+def still_here(guild, rows):
+    """Drop people who have left the server or are excluded from the race."""
+    return [r for r in rows if guild.get_member(r["user_id"]) and not is_excluded(guild, r["user_id"])]
 
 
 # ---------- Bot ----------
@@ -179,6 +221,8 @@ invite_cache = {}                               # code -> uses
 
 
 async def award(user_id, amount, reason, note=None, month=None):
+    if is_excluded(bot.get_guild(GUILD_ID), user_id):
+        return
     await bot.pool.execute(
         "INSERT INTO points (guild_id, user_id, month, amount, reason, note) VALUES ($1,$2,$3,$4,$5,$6)",
         GUILD_ID, user_id, month or month_key(), amount, reason, note,
@@ -214,10 +258,62 @@ async def top(month, limit=10):
     )
 
 
+# ---------- Earning: daily check-in (automatic) ----------
+async def auto_checkin(user_id):
+    """First activity of the day = +10 (and a streak bonus every 7 days). Returns the streak, or None if already checked in."""
+    today = now().date()
+    streak = await bot.pool.fetchval(
+        """INSERT INTO user_state (guild_id, user_id, daily_last, streak) VALUES ($1,$2,$3,1)
+           ON CONFLICT (guild_id, user_id) DO UPDATE SET
+             streak = CASE WHEN user_state.daily_last = $4 THEN user_state.streak + 1 ELSE 1 END,
+             daily_last = $3
+           WHERE user_state.daily_last IS DISTINCT FROM $3
+           RETURNING streak""",
+        GUILD_ID, user_id, today, today - dt.timedelta(days=1))
+    if streak is None:
+        return None
+    await award(user_id, DAILY_POINTS, "daily")
+    if streak % STREAK_LEN == 0:
+        await award(user_id, STREAK_BONUS, "streak")
+    return streak
+
+
+# ---------- Earning: winning slips ----------
+async def handle_slip(msg):
+    """+15 for a post with a screenshot in the winning channel. Reposted images earn nothing."""
+    images = [a for a in msg.attachments if (a.content_type or "").startswith("image/")]
+    if not images:
+        return
+    if await points_today(msg.author.id, "slip") >= SLIP_POINTS * SLIP_DAILY_MAX:
+        return
+    fresh = False
+    for a in images:
+        try:
+            digest = hashlib.sha256(await a.read()).hexdigest()
+        except discord.HTTPException:
+            continue
+        inserted = await bot.pool.fetchval(
+            """INSERT INTO slip_images (guild_id, hash, user_id, message_id) VALUES ($1,$2,$3,$4)
+               ON CONFLICT DO NOTHING RETURNING 1""",
+            GUILD_ID, digest, msg.author.id, msg.id)
+        fresh = fresh or bool(inserted)
+    if not fresh:
+        return
+    await award(msg.author.id, SLIP_POINTS, "slip", note=str(msg.id))
+    try:
+        await msg.add_reaction("✅")   # lets the member know it counted
+    except discord.HTTPException:
+        pass
+
+
 # ---------- Earning: messages ----------
 @bot.event
 async def on_message(msg):
     if msg.author.bot or not msg.guild or msg.guild.id != GUILD_ID:
+        return
+    await auto_checkin(msg.author.id)
+    if WINS_CHANNEL_ID and msg.channel.id == WINS_CHANNEL_ID:
+        await handle_slip(msg)
         return
     if ALLOWED_CHANNELS and msg.channel.id not in ALLOWED_CHANNELS:
         return
@@ -250,7 +346,8 @@ async def on_message(msg):
 async def on_raw_reaction_add(p):
     if p.guild_id != GUILD_ID or p.member is None or p.member.bot:
         return
-    if ALLOWED_CHANNELS and p.channel_id not in ALLOWED_CHANNELS:
+    await auto_checkin(p.user_id)
+    if ALLOWED_CHANNELS and p.channel_id not in ALLOWED_CHANNELS and p.channel_id != WINS_CHANNEL_ID:
         return
     author_id = getattr(p, "message_author_id", None)
     if author_id is None:
@@ -406,7 +503,9 @@ async def crown_champion(guild, user_id):
 
 
 async def board_embed(guild):
-    rows = await top(month_key(), 10)
+    everyone = still_here(guild, await top(month_key(), 5000))
+    rows = everyone[:10]
+    vip_leaders = [(i + 1, r) for i, r in enumerate(everyone) if is_vip(guild, r["user_id"])][:3]
     champ = await current_champion()
     lines = []
     if champ:
@@ -427,6 +526,12 @@ async def board_embed(guild):
         description="\n".join(lines) if rows else "\n".join(lines + ["No points yet this month. Start chatting!"]),
         color=0xF0B232,
     )
+    if vip_leaders:
+        vip_lines = [f"{MEDALS[n]} {display(guild, r['user_id'])} — `{r['pts']:,} pts` (#{overall} overall)"
+                     for n, (overall, r) in enumerate(vip_leaders)]
+        e.add_field(name=f"👑 VIP race · leader wins {VIP_PRIZE}", value="\n".join(vip_lines), inline=False)
+    else:
+        e.add_field(name=f"👑 VIP race · leader wins {VIP_PRIZE}", value="No VIPs on the board yet. Wide open!", inline=False)
     e.add_field(name="Prize", value=PRIZE, inline=True)
     e.add_field(name="Top VIP bonus", value=VIP_PRIZE, inline=True)
     e.add_field(name="Ends", value=discord.utils.format_dt(next_month_start(), "R"), inline=True)
@@ -437,9 +542,10 @@ async def board_embed(guild):
 def earn_embed():
     e = discord.Embed(title="How to earn points", color=0x5865F2)
     e.description = (
-        f"💬 Send a message (5+ characters, once per minute) — **+{MSG_POINTS}**\n"
-        f"📅 Daily check-in with `/daily` — **+{DAILY_POINTS}**\n"
-        f"🔥 {STREAK_LEN}-day check-in streak — **+{STREAK_BONUS}**\n"
+        f"💬 Send a message (5+ characters, one every {MSG_COOLDOWN_SEC} seconds) — **+{MSG_POINTS}**\n"
+        f"📅 Show up each day (your first message or reaction) — **+{DAILY_POINTS}**, automatic\n"
+        f"🔥 Show up {STREAK_LEN} days in a row — **+{STREAK_BONUS}**\n"
+        f"🧾 Post a winning slip screenshot — **+{SLIP_POINTS}** (up to {SLIP_DAILY_MAX} a day, no reposts)\n"
         f"⭐ Reaction on your message (max {REACT_DAILY_CAP}/day) — **+{REACT_POINTS}**\n"
         f"📨 Invite someone who stays {INVITE_STAY_DAYS} days and chats — **+{INVITE_POINTS}**\n\n"
         f"Message points cap at {MSG_DAILY_CAP}/day. Spam, repeats, self-reactions and alt accounts "
@@ -480,6 +586,7 @@ async def stats_embed(guild, user):
         name="Breakdown",
         value=(f"Messages: {by_reason.get('message', 0)}\n"
                f"Check-ins: {by_reason.get('daily', 0) + by_reason.get('streak', 0)}\n"
+               f"Winning slips: {by_reason.get('slip', 0)}\n"
                f"Reactions: {by_reason.get('reaction', 0)}\n"
                f"Invites: {by_reason.get('invite', 0) + by_reason.get('invite_revoked', 0)}"),
         inline=False)
@@ -487,42 +594,103 @@ async def stats_embed(guild, user):
     return e
 
 
-async def winners_embed(guild):
-    rows = await bot.pool.fetch(
-        """SELECT * FROM winners WHERE guild_id=$1
-           AND month IN (SELECT DISTINCT month FROM winners WHERE guild_id=$1 ORDER BY month DESC LIMIT 3)
-           ORDER BY month DESC, kind ASC, place ASC""", GUILD_ID)
-    e = discord.Embed(title="Past winners", color=0xF0B232)
-    if not rows:
-        e.description = "No winners yet. This month could be yours."
-        return e
-    months = {}
-    for r in rows:
-        label = "👑 Top VIP" if r["kind"] == "vip" else MEDALS[r["place"] - 1]
-        months.setdefault(r["month"], []).append(
-            f"{label} {display(guild, r['user_id'])} — {r['points']:,} pts")
-    for m, lines in months.items():
-        name = dt.datetime.strptime(m, "%Y-%m").strftime("%B %Y")
-        e.add_field(name=name, value="\n".join(lines), inline=False)
+async def vip_embed(guild):
+    everyone = still_here(guild, await top(month_key(), 5000))
+    vips = [(i + 1, r) for i, r in enumerate(everyone) if is_vip(guild, r["user_id"])][:15]
+    lines = []
+    for n, (overall, r) in enumerate(vips):
+        rank = MEDALS[n] if n < 3 else f"`#{n + 1}`"
+        lines.append(f"{rank} {display(guild, r['user_id'])} — `{r['pts']:,} pts` (#{overall} overall)")
+    e = discord.Embed(
+        title=f"👑 VIP race: {now().strftime('%B')}",
+        description=("Only VIPs, ranked by the same points as the main board. The leader wins the VIP bonus.\n\n"
+                     + ("\n".join(lines) or "No VIPs on the board yet. Wide open!")),
+        color=0xF0B232)
+    e.add_field(name="VIP bonus prize", value=VIP_PRIZE, inline=True)
+    e.add_field(name="Ends", value=discord.utils.format_dt(next_month_start(), "R"), inline=True)
+    e.set_footer(text="Updates live every time you open this tab")
     return e
 
 
-class BoardView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
+async def champions_embed(guild):
+    rows = await bot.pool.fetch(
+        """SELECT month, user_id, points FROM winners WHERE guild_id=$1 AND kind='main' AND place=1
+           ORDER BY month DESC LIMIT 12""", GUILD_ID)
+    e = discord.Embed(title="🏆 Hall of Champions", color=0xC27CFF)
+    if not rows:
+        e.description = "No champions yet. The first Monthly Champion is crowned on the 1st."
+        return e
+    lines = []
+    for i, r in enumerate(rows):
+        name = dt.datetime.strptime(r["month"], "%Y-%m").strftime("%B %Y")
+        tag = " · **current champion**" if i == 0 else ""
+        lines.append(f"🏆 **{display(guild, r['user_id'])}** — {name} · {r['points']:,} pts{tag}")
+    e.description = "\n".join(lines)
+    titles = await bot.pool.fetchrow(
+        """SELECT user_id, COUNT(*)::int AS n FROM winners WHERE guild_id=$1 AND kind='main' AND place=1
+           GROUP BY user_id ORDER BY n DESC, MAX(month) DESC LIMIT 1""", GUILD_ID)
+    if titles and titles["n"] > 1:
+        e.add_field(name="Most titles", value=f"{display(guild, titles['user_id'])} — {titles['n']} 🏆")
+    e.set_footer(text="Every Monthly Champion since the giveaway started")
+    return e
 
-    @discord.ui.button(label="My stats", style=discord.ButtonStyle.secondary, custom_id="lb:stats")
-    async def my_stats(self, interaction, button):
-        await interaction.response.send_message(
-            embed=await stats_embed(interaction.guild, interaction.user), ephemeral=True)
 
-    @discord.ui.button(label="How to earn", style=discord.ButtonStyle.secondary, custom_id="lb:earn")
-    async def how_to_earn(self, interaction, button):
+# ---------- Tabs ----------
+# Discord has no real tabs, so these are buttons. On the public board, a tab opens your own
+# private copy ("Only you can see this"). Inside that copy, tabs switch in place.
+TABS = [("month", "This month", "📊"), ("vip", "VIP race", "👑"), ("champs", "Champions", "🏆"), ("stats", "My stats", "👤")]
+
+
+async def tab_embed(tab, guild, user):
+    if tab == "vip":
+        return await vip_embed(guild)
+    if tab == "champs":
+        return await champions_embed(guild)
+    if tab == "stats":
+        return await stats_embed(guild, user)
+    return await board_embed(guild)
+
+
+class TabButton(discord.ui.Button):
+    def __init__(self, tab, label, emoji, active, public):
+        super().__init__(label=label, emoji=emoji, row=0,
+                         style=discord.ButtonStyle.primary if active else discord.ButtonStyle.secondary,
+                         custom_id=f"lb:tab:{tab}" if public else None)
+        self.tab, self.public = tab, public
+
+    async def callback(self, interaction: discord.Interaction):
+        embed = await tab_embed(self.tab, interaction.guild, interaction.user)
+        if self.public:
+            await interaction.response.send_message(embed=embed, view=TabView(self.tab), ephemeral=True)
+        else:
+            await interaction.response.edit_message(embed=embed, view=TabView(self.tab))
+
+
+class EarnButton(discord.ui.Button):
+    def __init__(self, public):
+        super().__init__(label="How to earn", style=discord.ButtonStyle.secondary, row=1,
+                         custom_id="lb:earn" if public else None)
+
+    async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_message(embed=earn_embed(), ephemeral=True)
 
-    @discord.ui.button(label="Past winners", style=discord.ButtonStyle.secondary, custom_id="lb:winners")
-    async def past_winners(self, interaction, button):
-        await interaction.response.send_message(embed=await winners_embed(interaction.guild), ephemeral=True)
+
+class BoardView(discord.ui.View):
+    """Buttons on the public board. Always shows This month as the active tab."""
+    def __init__(self):
+        super().__init__(timeout=None)
+        for tab, label, emoji in TABS:
+            self.add_item(TabButton(tab, label, emoji, active=(tab == "month"), public=True))
+        self.add_item(EarnButton(public=True))
+
+
+class TabView(discord.ui.View):
+    """Buttons on someone's private copy. Tabs switch in place."""
+    def __init__(self, active):
+        super().__init__(timeout=900)
+        for tab, label, emoji in TABS:
+            self.add_item(TabButton(tab, label, emoji, active=(tab == active), public=False))
+        self.add_item(EarnButton(public=False))
 
 
 # ---------- Live board + month close ----------
@@ -560,7 +728,7 @@ async def review_lines(guild, user_id, month):
 
 
 async def close_month(guild, month):
-    rows = await top(month, 200)
+    rows = still_here(guild, await top(month, 200))
     podium = rows[:3]
     vip_row = next((r for r in rows if is_vip(guild, r["user_id"])), None)
 
@@ -610,6 +778,132 @@ async def close_month(guild, month):
         await staff_ch.send(embed=e)
 
 
+# ---------- VIP loyalty badges ----------
+def months_between(start, end):
+    months = (end.year - start.year) * 12 + (end.month - start.month)
+    if end.day < start.day:
+        months -= 1
+    return max(months, 0)
+
+
+async def vip_months(user_id):
+    since = await bot.pool.fetchval(
+        "SELECT vip_since FROM vip_tenure WHERE guild_id=$1 AND user_id=$2 AND lost_at IS NULL", GUILD_ID, user_id)
+    return months_between(since, discord.utils.utcnow()) if since else 0
+
+
+@bot.event
+async def on_member_update(before, after):
+    if after.guild.id != GUILD_ID or not VIP_ROLE_ID:
+        return
+    had = any(r.id == VIP_ROLE_ID for r in before.roles)
+    has = any(r.id == VIP_ROLE_ID for r in after.roles)
+    utc = discord.utils.utcnow()
+    if has and not had:
+        row = await bot.pool.fetchrow(
+            "SELECT lost_at FROM vip_tenure WHERE guild_id=$1 AND user_id=$2", GUILD_ID, after.id)
+        if row and row["lost_at"] and utc - row["lost_at"] <= dt.timedelta(days=VIP_GRACE_DAYS):
+            await bot.pool.execute(   # came back in time: keep their streak
+                "UPDATE vip_tenure SET lost_at=NULL WHERE guild_id=$1 AND user_id=$2", GUILD_ID, after.id)
+        else:
+            await bot.pool.execute(
+                """INSERT INTO vip_tenure (guild_id, user_id, vip_since) VALUES ($1,$2,$3)
+                   ON CONFLICT (guild_id, user_id) DO UPDATE SET vip_since=$3, lost_at=NULL""",
+                GUILD_ID, after.id, utc)
+    elif had and not has:
+        await bot.pool.execute(
+            "UPDATE vip_tenure SET lost_at=$3 WHERE guild_id=$1 AND user_id=$2 AND lost_at IS NULL",
+            GUILD_ID, after.id, utc)
+
+
+async def sync_loyalty(guild):
+    """Keep each VIP's loyalty badge matching how long they've been VIP."""
+    vip_role = guild.get_role(VIP_ROLE_ID) if VIP_ROLE_ID else None
+    if vip_role is None:
+        return
+    utc = discord.utils.utcnow()
+    # anyone who's VIP but not tracked yet starts counting now
+    for m in vip_role.members:
+        await bot.pool.execute(
+            "INSERT INTO vip_tenure (guild_id, user_id, vip_since) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
+            GUILD_ID, m.id, utc)
+    # lapsed longer than the grace period: tenure is gone
+    await bot.pool.execute(
+        "DELETE FROM vip_tenure WHERE guild_id=$1 AND lost_at IS NOT NULL AND lost_at < $2",
+        GUILD_ID, utc - dt.timedelta(days=VIP_GRACE_DAYS))
+    if not LOYALTY_TIERS:
+        return
+    tier_roles = {m: guild.get_role(rid) for m, rid in LOYALTY_TIERS}
+    all_tier_roles = {r for r in tier_roles.values() if r}
+    rows = await bot.pool.fetch(
+        "SELECT user_id, vip_since FROM vip_tenure WHERE guild_id=$1 AND lost_at IS NULL", GUILD_ID)
+    since = {r["user_id"]: r["vip_since"] for r in rows}
+    lounge = guild.get_channel(VIP_LOUNGE_CHANNEL_ID) if VIP_LOUNGE_CHANNEL_ID else None
+    # everyone who is VIP or still holds a badge
+    people = set(vip_role.members) | {m for r in all_tier_roles for m in r.members}
+    for m in people:
+        target = None
+        if vip_role in m.roles and m.id in since:
+            months = months_between(since[m.id], utc)
+            target = next((tier_roles[t] for t, _ in LOYALTY_TIERS if months >= t and tier_roles[t]), None)
+        remove = [r for r in all_tier_roles if r in m.roles and r != target]
+        if remove:
+            await m.remove_roles(*remove, reason="Loyalty badge update")
+        if target and target not in m.roles:
+            await m.add_roles(target, reason="VIP loyalty badge")
+            if lounge:
+                months = months_between(since[m.id], utc)
+                await lounge.send(f"🎉 {m.mention} has been VIP for **{months} months** and earned **{target.name}**! "
+                                  "Thanks for sticking with us 👑")
+
+
+# ---------- VIP monthly recap DMs ----------
+async def send_vip_recaps(guild, month):
+    if await get_setting(f"recap_sent:{month}"):
+        return
+    await set_setting(f"recap_sent:{month}", "1")
+    vip_role = guild.get_role(VIP_ROLE_ID) if VIP_ROLE_ID else None
+    if vip_role is None:
+        return
+    rows = still_here(guild, await top(month, 5000))
+    overall = {r["user_id"]: (i + 1, r["pts"]) for i, r in enumerate(rows)}
+    vips = [r for r in rows if is_vip(guild, r["user_id"])]
+    vip_rank = {r["user_id"]: i + 1 for i, r in enumerate(vips)}
+    month_name = dt.datetime.strptime(month, "%Y-%m").strftime("%B")
+    next_tiers = sorted(t for t, _ in LOYALTY_TIERS)
+    for m in vip_role.members:
+        if m.bot or is_excluded(guild, m.id) or m.id not in overall:
+            continue
+        rank, pts = overall[m.id]
+        counts = {r["reason"]: r["n"] for r in await bot.pool.fetch(
+            "SELECT reason, COUNT(*)::int AS n FROM points WHERE guild_id=$1 AND user_id=$2 AND month=$3 GROUP BY reason",
+            GUILD_ID, m.id, month)}
+        tenure = await vip_months(m.id)
+        e = discord.Embed(title=f"👑 Your {month_name} recap", color=0xF0B232)
+        e.add_field(name="Points", value=f"{pts:,}", inline=True)
+        e.add_field(name="Final rank", value=f"#{rank} of {len(rows)}", inline=True)
+        e.add_field(name="VIP race", value=f"#{vip_rank[m.id]} of {len(vips)} VIPs", inline=True)
+        e.add_field(name="Days you showed up", value=str(counts.get("daily", 0)), inline=True)
+        e.add_field(name="Winning slips posted", value=str(counts.get("slip", 0)), inline=True)
+        e.add_field(name="Reactions received", value=str(counts.get("reaction", 0)), inline=True)
+        upcoming = next((t for t in next_tiers if t > tenure), None)
+        loyalty = f"{tenure} month{'s' if tenure != 1 else ''} in a row"
+        if upcoming:
+            left = upcoming - tenure
+            loyalty += f" · {left} more to your {upcoming}-month badge"
+        e.add_field(name="VIP streak", value=loyalty, inline=False)
+        if vip_rank[m.id] == 1:
+            e.description = f"🏆 You were the top VIP and won **{VIP_PRIZE}**!"
+        elif rank == 1:
+            e.description = f"🏆 You won the whole thing: **{PRIZE}**!"
+        e.set_footer(text="A new race started today. Good luck this month!")
+        try:
+            await m.send(embed=e)
+        except discord.HTTPException:
+            pass   # DMs closed
+        await asyncio.sleep(1.5)   # stay well under Discord's rate limits
+
+
 async def maybe_close_month(guild):
     current = month_key()
     active = await get_setting("active_month")
@@ -620,6 +914,7 @@ async def maybe_close_month(guild):
         await set_setting("active_month", current)
         await close_month(guild, active)
         await set_setting("board_message_id", "")   # start a fresh board post for the new month
+        asyncio.create_task(send_vip_recaps(guild, active))
 
 
 @tasks.loop(minutes=10)
@@ -627,7 +922,7 @@ async def ticker():
     guild = bot.get_guild(GUILD_ID)
     if guild is None:
         return
-    for step in (maybe_close_month, check_pending_invites, refresh_board):
+    for step in (maybe_close_month, check_pending_invites, sync_loyalty, refresh_board):
         try:
             await step(guild)
         except Exception as exc:
@@ -640,34 +935,29 @@ async def before_ticker():
 
 
 # ---------- Slash commands ----------
-@bot.tree.command(name="daily", description="Check in once a day for points")
+@bot.tree.command(name="daily", description="Check your daily check-in and streak")
 async def daily(interaction: discord.Interaction):
     uid = interaction.user.id
-    today = now().date()
-    row = await bot.pool.fetchrow(
-        "SELECT daily_last, streak FROM user_state WHERE guild_id=$1 AND user_id=$2", GUILD_ID, uid)
-    last, streak = (row["daily_last"], row["streak"]) if row else (None, 0)
-    if last == today:
-        await interaction.response.send_message(
-            f"You already checked in today. Streak: {streak} days. Come back tomorrow!", ephemeral=True)
+    if is_excluded(interaction.guild, uid):
+        await interaction.response.send_message("You're staff, so you're not in the race. 🙂", ephemeral=True)
         return
-    streak = streak + 1 if last == today - dt.timedelta(days=1) else 1
-    await bot.pool.execute(
-        """INSERT INTO user_state (guild_id, user_id, daily_last, streak) VALUES ($1,$2,$3,$4)
-           ON CONFLICT (guild_id, user_id) DO UPDATE SET daily_last=$3, streak=$4""",
-        GUILD_ID, uid, today, streak)
-    await award(uid, DAILY_POINTS, "daily")
-    text = f"✅ +{DAILY_POINTS} points. Streak: {streak} days."
-    if streak % STREAK_LEN == 0:
-        await award(uid, STREAK_BONUS, "streak")
-        text += f" 🔥 {STREAK_LEN}-day streak bonus: +{STREAK_BONUS}!"
+    streak = await auto_checkin(uid)
+    if streak is None:
+        streak = await bot.pool.fetchval(
+            "SELECT streak FROM user_state WHERE guild_id=$1 AND user_id=$2", GUILD_ID, uid) or 0
+        text = f"✅ You're already checked in today. Streak: {streak} days."
+    else:
+        text = f"✅ +{DAILY_POINTS} points. Streak: {streak} days."
+        if streak % STREAK_LEN == 0:
+            text += f" 🔥 {STREAK_LEN}-day streak bonus: +{STREAK_BONUS}!"
+    text += "\nTip: you don't need this command. Your first message or reaction each day checks you in automatically."
     await interaction.response.send_message(text, ephemeral=True)
 
 
 @bot.tree.command(name="leaderboard", description="See this month's leaderboard")
 async def leaderboard(interaction: discord.Interaction):
     await interaction.response.send_message(
-        embed=await board_embed(interaction.guild), view=BoardView(), ephemeral=True)
+        embed=await board_embed(interaction.guild), view=TabView("month"), ephemeral=True)
 
 
 @bot.tree.command(name="points_adjust", description="Staff: add or remove points")
@@ -698,6 +988,25 @@ async def recrown(interaction: discord.Interaction, month: str):
     await close_month(interaction.guild, month)
     await refresh_board(interaction.guild)
     await interaction.followup.send(f"Re-announced {month} and moved the Monthly Champion role.", ephemeral=True)
+
+
+@bot.tree.command(name="vip_since", description="Staff: set when someone first became VIP (for loyalty badges)")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.describe(date="YYYY-MM-DD they started VIP")
+async def vip_since(interaction: discord.Interaction, member: discord.Member, date: str):
+    try:
+        start = dt.datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=TZ)
+    except ValueError:
+        await interaction.response.send_message("Use the format YYYY-MM-DD, like 2026-03-15.", ephemeral=True)
+        return
+    await bot.pool.execute(
+        """INSERT INTO vip_tenure (guild_id, user_id, vip_since) VALUES ($1,$2,$3)
+           ON CONFLICT (guild_id, user_id) DO UPDATE SET vip_since=$3, lost_at=NULL""",
+        GUILD_ID, member.id, start)
+    months = months_between(start, discord.utils.utcnow())
+    await interaction.response.send_message(
+        f"{member.mention} has been VIP since {date} ({months} months). Their badge updates within 10 minutes.",
+        ephemeral=True)
 
 
 @bot.tree.command(name="undisqualify", description="Staff: restore someone to the race")
